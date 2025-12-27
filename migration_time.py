@@ -8,14 +8,26 @@ load_dotenv()
 
 def write_output(file, text):
     """Write to both console and file"""
-    print(text)
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        # Fallback for Windows console encoding issues
+        print(text.encode('utf-8', errors='replace').decode('utf-8', errors='replace'))
     file.write(text + "\n")
+
+def format_size(bytes_value):
+    """Convert bytes to human-readable format"""
+    mb = bytes_value / (1024 * 1024)
+    gb = mb / 1024
+    if gb >= 1:
+        return f"{gb:.2f} GB"
+    return f"{mb:.2f} MB"
 
 def calculate_migration_time():
     """
-    Calculate time needed to migrate ECR repositories where:
-    1. Repository has images pushed within the date range
-    2. Repository has NOT been pulled in the last 1 year (365 days)
+    Calculate time needed to migrate ECR images where:
+    1. Image was pushed within the date range
+    2. Image has NOT been pulled in the last 1 year (365 days)
     Migration speed: 1.33 MB/s
     """
     
@@ -61,26 +73,33 @@ def calculate_migration_time():
         )
         
         # Write header
-        write_output(output_file, "=" * 70)
-        write_output(output_file, "ECR MIGRATION TIME CALCULATION REPORT")
-        write_output(output_file, "=" * 70)
-        write_output(output_file, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        write_output(output_file, f"AWS Region: {aws_region}")
+        write_output(output_file, "")
+        write_output(output_file, "+" + "=" * 78 + "+")
+        write_output(output_file, "|" + " " * 78 + "|")
+        write_output(output_file, "|" + "       ECR TO S3 MIGRATION ANALYSIS REPORT".center(78) + "|")
+        write_output(output_file, "|" + " " * 78 + "|")
+        write_output(output_file, "+" + "=" * 78 + "+")
+        write_output(output_file, "")
+        write_output(output_file, "  Report Generated : " + datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        write_output(output_file, "  AWS Region       : " + aws_region)
         if repository_name:
-            write_output(output_file, f"Target: Single repository '{repository_name}'")
+            write_output(output_file, "  Target Scope     : Single Repository '" + repository_name + "'")
         else:
-            write_output(output_file, f"Target: ALL repositories")
-        write_output(output_file, f"Build date range: {start_date_str} to {end_date_str}")
-        write_output(output_file, f"Migration criteria: Repositories NOT pulled since {one_year_ago.date()}")
-        write_output(output_file, "=" * 70)
+            write_output(output_file, "  Target Scope     : All Repositories")
+        write_output(output_file, "  Build Date Range : " + start_date_str + " to " + end_date_str)
+        write_output(output_file, "  Migration Rule   : Images NOT pulled since " + one_year_ago.strftime('%Y-%m-%d'))
+        write_output(output_file, "")
+        write_output(output_file, "-" * 80)
         write_output(output_file, "")
         
         total_size_bytes = 0
-        total_image_count = 0
-        repositories_to_migrate = 0
-        repositories_skipped = 0
+        total_images_to_migrate = 0
+        total_images_to_keep = 0
         repositories_processed = 0
-        skipped_repos_details = []  # Store details of skipped repositories
+        repositories_with_migrations = 0
+        
+        migration_details = []  # Store details for summary
+        kept_details = []       # Store details for kept images
         
         try:
             # Get repositories to scan
@@ -92,7 +111,7 @@ def calculate_migration_time():
                     response = ecr_client.describe_repositories(repositoryNames=[repository_name])
                     repositories_to_scan = response['repositories']
                 except ecr_client.exceptions.RepositoryNotFoundException:
-                    error_msg = f"Error: Repository '{repository_name}' not found"
+                    error_msg = f"ERROR: Repository '{repository_name}' not found"
                     write_output(output_file, error_msg)
                     return
             else:
@@ -103,144 +122,187 @@ def calculate_migration_time():
                 for repo_page in repo_pages:
                     repositories_to_scan.extend(repo_page['repositories'])
             
+            # Process each repository
             for repository in repositories_to_scan:
                 repo_name = repository['repositoryName']
                 repositories_processed += 1
                 
-                write_output(output_file, f"\n[Repository: {repo_name}]")
-                write_output(output_file, "-" * 70)
+                repo_migrate_count = 0
+                repo_keep_count = 0
+                repo_migrate_size = 0
                 
-                repo_image_count = 0
-                repo_size_bytes = 0
-                repo_should_migrate = True
-                repo_last_pull = None
-                images_in_date_range = []
+                write_output(output_file, "+-- REPOSITORY: " + repo_name)
+                write_output(output_file, "|")
                 
                 try:
                     # Get all images from this repository
                     image_paginator = ecr_client.get_paginator('describe_images')
                     image_pages = image_paginator.paginate(repositoryName=repo_name)
                     
-                    # First pass: check if repository was pulled recently
+                    images_in_date_range = []
+                    
+                    # Collect images within date range
                     for image_page in image_pages:
                         for image in image_page['imageDetails']:
-                            last_pulled = image.get('lastRecordedPullTime')
-                            
-                            # Track the most recent pull in the entire repository
-                            if last_pulled:
-                                if repo_last_pull is None or last_pulled > repo_last_pull:
-                                    repo_last_pull = last_pulled
-                            
-                            # Collect images within date range
                             push_date = image['imagePushedAt']
                             if start_date <= push_date.replace(tzinfo=None) <= end_date:
                                 images_in_date_range.append(image)
                     
-                    # Check if repository should be migrated
-                    if repo_last_pull is None:
-                        repo_should_migrate = True
-                        pull_status = "Never pulled - WILL MIGRATE"
-                    elif repo_last_pull.replace(tzinfo=None) < one_year_ago:
-                        repo_should_migrate = True
-                        pull_status = f"Last pulled: {repo_last_pull.date()} - WILL MIGRATE"
-                    else:
-                        repo_should_migrate = False
-                        pull_status = f"Recently pulled: {repo_last_pull.date()} - SKIPPED"
-                        repositories_skipped += 1
-                        
-                        # Store skipped repository details
-                        skipped_repos_details.append({
-                            'name': repo_name,
-                            'last_pull': repo_last_pull.date(),
-                            'images_count': len(images_in_date_range)
-                        })
+                    if len(images_in_date_range) == 0:
+                        write_output(output_file, "|  [INFO] No images found in specified date range")
+                        write_output(output_file, "|")
+                        write_output(output_file, "+" + "-" * 79)
+                        write_output(output_file, "")
+                        continue
                     
-                    write_output(output_file, f"  Status: {pull_status}")
-                    write_output(output_file, f"  Images in date range: {len(images_in_date_range)}")
+                    write_output(output_file, "|  Images in date range: " + str(len(images_in_date_range)))
+                    write_output(output_file, "|")
                     
-                    # If repository should be migrated, process all images in date range
-                    if repo_should_migrate and len(images_in_date_range) > 0:
-                        repositories_to_migrate += 1
-                        write_output(output_file, f"  Images to migrate:")
+                    # Evaluate EACH image individually
+                    for image in images_in_date_range:
+                        image_size = image['imageSizeInBytes']
+                        tags = image.get('imageTags', ['<untagged>'])
+                        tag_name = tags[0] if tags else '<untagged>'
+                        push_date = image['imagePushedAt']
+                        last_pulled = image.get('lastRecordedPullTime')
                         
-                        for image in images_in_date_range:
-                            image_size = image['imageSizeInBytes']
-                            repo_size_bytes += image_size
-                            repo_image_count += 1
+                        # Decision logic for THIS specific image
+                        should_migrate = False
+                        status_reason = ""
+                        
+                        if last_pulled is None:
+                            should_migrate = True
+                            status_reason = "Never pulled"
+                        elif last_pulled.replace(tzinfo=None) < one_year_ago:
+                            should_migrate = True
+                            days_since_pull = (datetime.now() - last_pulled.replace(tzinfo=None)).days
+                            status_reason = f"Last pulled {days_since_pull} days ago"
+                        else:
+                            should_migrate = False
+                            days_since_pull = (datetime.now() - last_pulled.replace(tzinfo=None)).days
+                            status_reason = f"Pulled {days_since_pull} days ago (recent)"
+                        
+                        # Format output line
+                        size_str = format_size(image_size)
+                        push_str = push_date.strftime('%Y-%m-%d')
+                        
+                        if should_migrate:
+                            # MIGRATE to S3
+                            repo_migrate_count += 1
+                            repo_migrate_size += image_size
+                            total_images_to_migrate += 1
+                            total_size_bytes += image_size
                             
-                            tags = image.get('imageTags', ['<untagged>'])
-                            size_mb = image_size / (1024 * 1024)
-                            push_date = image['imagePushedAt']
-                            write_output(output_file, f"    [MIGRATE] {tags[0]:<40} {size_mb:>8.2f} MB  {push_date.date()}")
-                        
-                        # Update totals
-                        total_size_bytes += repo_size_bytes
-                        total_image_count += repo_image_count
-                        
-                        repo_size_mb = repo_size_bytes / (1024 * 1024)
-                        write_output(output_file, f"  Repository total: {repo_image_count} images, {repo_size_mb:.2f} MB")
-                    elif not repo_should_migrate and len(images_in_date_range) > 0:
-                        write_output(output_file, f"  [SKIP] Skipping all {len(images_in_date_range)} images (repository pulled recently)")
+                            write_output(output_file, f"|  >> MIGRATE >> {tag_name:<35} {size_str:>10}  Pushed: {push_str}  ({status_reason})")
+                            
+                            migration_details.append({
+                                'repo': repo_name,
+                                'tag': tag_name,
+                                'size': image_size,
+                                'push_date': push_str,
+                                'reason': status_reason
+                            })
+                        else:
+                            # KEEP in ECR
+                            repo_keep_count += 1
+                            total_images_to_keep += 1
+                            
+                            write_output(output_file, f"|  -- KEEP ECR -- {tag_name:<35} {size_str:>10}  Pushed: {push_str}  ({status_reason})")
+                            
+                            kept_details.append({
+                                'repo': repo_name,
+                                'tag': tag_name,
+                                'size': image_size,
+                                'push_date': push_str,
+                                'reason': status_reason
+                            })
+                    
+                    # Repository summary
+                    write_output(output_file, "|")
+                    if repo_migrate_count > 0:
+                        repositories_with_migrations += 1
+                        write_output(output_file, f"|  Repository Summary: {repo_migrate_count} to migrate ({format_size(repo_migrate_size)}), {repo_keep_count} to keep in ECR")
                     else:
-                        write_output(output_file, f"  No images found in date range")
-                
+                        write_output(output_file, f"|  Repository Summary: All {repo_keep_count} images remain in ECR (recently used)")
+                    
                 except Exception as e:
-                    write_output(output_file, f"  Error processing repository: {e}")
-            
-            # Calculate total size in different units
-            total_size_mb = total_size_bytes / (1024 * 1024)
-            total_size_gb = total_size_mb / 1024
+                    write_output(output_file, f"|  [ERROR] Failed to process repository: {e}")
+                
+                write_output(output_file, "|")
+                write_output(output_file, "+" + "-" * 79)
+                write_output(output_file, "")
             
             # Calculate migration time at 1.33 MB/s
             speed_mb_per_sec = 1.33
+            total_size_mb = total_size_bytes / (1024 * 1024)
             time_seconds = total_size_mb / speed_mb_per_sec if total_size_mb > 0 else 0
             time_minutes = time_seconds / 60
             time_hours = time_minutes / 60
+            time_days = time_hours / 24
             
-            # Display final results
-            write_output(output_file, "\n" + "=" * 70)
-            write_output(output_file, "COMPLETE MIGRATION SUMMARY")
-            write_output(output_file, "=" * 70)
-            write_output(output_file, f"Total repositories scanned: {repositories_processed}")
-            write_output(output_file, f"Repositories to migrate: {repositories_to_migrate}")
-            write_output(output_file, f"Repositories skipped (pulled recently): {repositories_skipped}")
-            write_output(output_file, f"Total images to migrate: {total_image_count}")
-            write_output(output_file, f"Total migration size: {total_size_mb:.2f} MB ({total_size_gb:.2f} GB)")
-            write_output(output_file, f"\nMigration speed: {speed_mb_per_sec} MB/s")
+            # Final Summary
+            write_output(output_file, "")
+            write_output(output_file, "+" + "=" * 78 + "+")
+            write_output(output_file, "|" + " " * 78 + "|")
+            write_output(output_file, "|" + "MIGRATION SUMMARY".center(78) + "|")
+            write_output(output_file, "|" + " " * 78 + "|")
+            write_output(output_file, "+" + "=" * 78 + "+")
+            write_output(output_file, "")
+            write_output(output_file, "  Repositories Analyzed")
+            write_output(output_file, "  " + "-" * 40)
+            write_output(output_file, f"    Total scanned                : {repositories_processed}")
+            write_output(output_file, f"    With images to migrate       : {repositories_with_migrations}")
+            write_output(output_file, "")
+            write_output(output_file, "  Images Analysis")
+            write_output(output_file, "  " + "-" * 40)
+            write_output(output_file, f"    Images to MIGRATE to S3      : {total_images_to_migrate}")
+            write_output(output_file, f"    Images to KEEP in ECR        : {total_images_to_keep}")
+            write_output(output_file, f"    Total images evaluated       : {total_images_to_migrate + total_images_to_keep}")
+            write_output(output_file, "")
+            write_output(output_file, "  Migration Size")
+            write_output(output_file, "  " + "-" * 40)
+            write_output(output_file, f"    Total data to migrate        : {format_size(total_size_bytes)}")
+            write_output(output_file, "")
             
-            if total_image_count > 0:
-                write_output(output_file, f"\nEstimated migration time:")
-                write_output(output_file, f"  - {time_seconds:.2f} seconds")
-                write_output(output_file, f"  - {time_minutes:.2f} minutes")
-                write_output(output_file, f"  - {time_hours:.2f} hours")
-                
+            if total_images_to_migrate > 0:
+                write_output(output_file, "  Estimated Migration Time (at 1.33 MB/s)")
+                write_output(output_file, "  " + "-" * 40)
+                write_output(output_file, f"    {time_seconds:,.0f} seconds")
+                write_output(output_file, f"    {time_minutes:,.1f} minutes")
+                write_output(output_file, f"    {time_hours:,.2f} hours")
                 if time_hours >= 24:
-                    time_days = time_hours / 24
-                    write_output(output_file, f"  - {time_days:.2f} days")
+                    write_output(output_file, f"    {time_days:,.2f} days")
+                write_output(output_file, "")
             else:
-                write_output(output_file, "\n[OK] No images to migrate!")
+                write_output(output_file, "  [RESULT] No images qualify for migration!")
+                write_output(output_file, "  All images in the date range have been pulled recently.")
+                write_output(output_file, "")
             
-            # Add detailed skipped repositories section
-            if len(skipped_repos_details) > 0:
-                write_output(output_file, "\n" + "=" * 70)
-                write_output(output_file, "SKIPPED REPOSITORIES DETAILS")
-                write_output(output_file, "=" * 70)
-                write_output(output_file, f"Total skipped: {len(skipped_repos_details)}")
-                write_output(output_file, "Reason: Recently pulled (within last 1 year)")
+            # Top 10 largest migrations
+            if len(migration_details) > 0:
+                write_output(output_file, "")
+                write_output(output_file, "+" + "=" * 78 + "+")
+                write_output(output_file, "|" + " " * 78 + "|")
+                write_output(output_file, "|" + "TOP 10 LARGEST MIGRATIONS".center(78) + "|")
+                write_output(output_file, "|" + " " * 78 + "|")
+                write_output(output_file, "+" + "=" * 78 + "+")
                 write_output(output_file, "")
                 
-                for repo in skipped_repos_details:
-                    write_output(output_file, f"Repository: {repo['name']}")
-                    write_output(output_file, f"  Last pulled: {repo['last_pull']}")
-                    write_output(output_file, f"  Images in date range: {repo['images_count']}")
+                sorted_migrations = sorted(migration_details, key=lambda x: x['size'], reverse=True)[:10]
+                
+                for idx, img in enumerate(sorted_migrations, 1):
+                    write_output(output_file, f"  {idx:2d}. {img['repo']}/{img['tag']}")
+                    write_output(output_file, f"      Size: {format_size(img['size'])}  |  {img['reason']}")
                     write_output(output_file, "")
             
-            write_output(output_file, "=" * 70)
-            write_output(output_file, f"\nReport saved to: {output_filename}")
-            print(f"\n*** Full report saved to: {output_filename} ***")
+            write_output(output_file, "")
+            write_output(output_file, "=" * 80)
+            write_output(output_file, "  Report saved to: " + output_filename)
+            write_output(output_file, "=" * 80)
+            print(f"\n*** Full report successfully saved to: {output_filename} ***")
             
         except Exception as e:
-            error_msg = f"Error accessing ECR: {e}"
+            error_msg = f"ERROR: Failed to access ECR: {e}"
             write_output(output_file, error_msg)
 
 if __name__ == "__main__":
