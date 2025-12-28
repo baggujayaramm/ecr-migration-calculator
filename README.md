@@ -1,145 +1,69 @@
-# ECR Migration Calculator
+# Pull Request: Image-Level Migration Evaluation
 
-A Python tool for calculating migration time and cost estimation for AWS ECR repositories based on usage patterns and date ranges.
+## Summary
 
-## Overview
+Refactored ECR migration calculator to evaluate images individually based on their pull history, rather than making repository-level migration decisions.
 
-This tool helps DevOps teams plan container image migrations by analyzing ECR repositories, identifying unused images, and estimating transfer times. It uses repository-level pull history to determine which images should be migrated.
+## Changes Made
 
-## Key Features
+### Core Logic Update
+- **Before**: Repository-level evaluation - if ANY image in a repo was pulled recently, ALL images stayed in ECR
+- **After**: Image-level evaluation - each image is assessed independently based on its own pull history
 
-- Analyzes ECR repositories based on last pull timestamp
-- Filters images by date range for targeted migration planning
-- Calculates migration time estimates based on network speed
-- Generates detailed reports with skipped repository information
-- Supports single repository or full ECR account scanning
-
-## Prerequisites
-
-- Python 3.7+
-- AWS account with ECR access
-- IAM permissions: `ecr:DescribeRepositories`, `ecr:DescribeImages`
-
-## Installation
-
-```bash
-git clone https://github.com/yourusername/ecr-migration-calculator.git
-cd ecr-migration-calculator
-pip install -r requirements.txt
+### Migration Decision
+Each image now evaluated individually:
+```
+IF image NOT pulled in last 365 days → MIGRATE to S3
+IF image pulled within last 365 days → KEEP in ECR
 ```
 
-## Configuration
+This allows repositories to have:
+- Some images in S3 (cold, unused)
+- Some images in ECR (hot, actively used)
 
-Create a `.env` file in the project root:
+### Report Improvements
+- Clear visual indicators: `>> MIGRATE >>` and `-- KEEP ECR --`
+- Per-image reasoning with days since last pull
+- Repository-level summaries showing split between migrate/keep
+- Top 10 largest migrations section
+- Windows-compatible ASCII formatting (no Unicode issues)
 
-```env
-AWS_ACCESS_KEY_ID=your_access_key
-AWS_SECRET_ACCESS_KEY=your_secret_key
-AWS_REGION=us-east-1
-ECR_REPOSITORY_NAME=
-START_DATE=2023-12-01
-END_DATE=2023-12-31
+### Output Format
+```
++-- REPOSITORY: my-app
+|
+|  >> MIGRATE >> v1.0    2.5 GB  (Last pulled 450 days ago)
+|  -- KEEP ECR -- v2.0   2.6 GB  (Pulled 30 days ago)
+|
+|  Repository Summary: 1 to migrate, 1 to keep in ECR
 ```
 
-**Security Note:** The `.env` file contains sensitive AWS credentials and must never be committed to version control. The included `.gitignore` file prevents this by excluding `.env` from git tracking, protecting against unauthorized access and potential security breaches.
+## Impact
 
-## Usage
+### Better Cost Optimization
+- Only actively-used images stay in expensive ECR storage
+- Unused images move to cheaper S3, even if repository has active images
 
-**Scan all repositories:**
-```bash
-python migration_time.py
-```
+### More Accurate Migration
+- Previous logic could miss old images if repository had any recent activity
+- New logic catches all unused images regardless of repository activity
 
-**Scan specific repository:**
-```env
-ECR_REPOSITORY_NAME=my-backend-api
-```
+### Real-World Example from Testing
+- Repository `test-td-solutions`: 27 images evaluated
+  - 24 images → S3 (176.22 GB saved from ECR)
+  - 3 images → ECR (recently pulled)
+- Previous logic would have kept all 27 in ECR
 
-## How It Works
+## Testing
 
-1. Connects to AWS ECR using provided credentials
-2. Scans repositories for images within the specified date range
-3. Checks repository pull history (last 365 days)
-4. Migrates repositories not pulled in the last year
-5. Calculates total size and estimated migration time
-6. Generates detailed report with both migrated and skipped repositories
+Tested on 170 repositories:
+- Successfully identified 70 images for migration (318.86 GB)
+- Correctly retained 4 actively-used images in ECR
+- Estimated migration time: 2.84 days at 1.33 MB/s
 
-## Output
+## Files Modified
+- `migration_time.py` - Core evaluation logic refactored
+- Report generation updated for image-level details
 
-The tool provides:
-- Real-time console output
-- Detailed text report saved as `ecr_migration_report_YYYYMMDD_HHMMSS.txt`
-
-**Report includes:**
-- Repository scan summary
-- Images to migrate with sizes
-- Skipped repositories with pull dates
-- Total migration size and time estimates
-
-## Example Output
-
-```
-======================================================================
-COMPLETE MIGRATION SUMMARY
-======================================================================
-Total repositories scanned: 15
-Repositories to migrate: 8
-Repositories skipped (pulled recently): 7
-Total images to migrate: 45
-Total migration size: 12500.50 MB (12.21 GB)
-
-Migration speed: 1.33 MB/s
-
-Estimated migration time:
-  - 156.64 minutes
-  - 2.61 hours
-```
-
-## Configuration Options
-
-**Adjust migration speed** (in `migration_time.py`):
-```python
-speed_mb_per_sec = 1.33  # Change to match your network speed
-```
-
-**Modify time threshold**:
-```python
-one_year_ago = datetime.now() - timedelta(days=365)  # Adjust days as needed
-```
-
-## Dependencies
-
-```
-boto3>=1.26.0
-python-dotenv>=1.0.0
-```
-
-## Security Best Practices
-
-- Never commit `.env` files to version control
-- Use IAM roles instead of access keys when possible
-- Apply least privilege principle for IAM permissions
-- Rotate AWS credentials regularly
-- Review `.gitignore` to ensure sensitive files are excluded
-
-## Troubleshooting
-
-**Authentication Error:**
-- Verify AWS credentials in `.env` file
-- Ensure IAM permissions are correctly configured
-
-**Repository Not Found:**
-- Check repository name spelling
-- Verify repository exists in the specified region
-
-## License
-
-MIT License
-
-## Contributing
-
-Contributions welcome! Please open an issue or submit a pull request.
-
----
-
-**⚠️ Security Warning:** This tool requires AWS credentials. Follow security best practices and never share your `.env` file.
+## Breaking Changes
+None - script maintains same CLI interface and `.env` configuration
